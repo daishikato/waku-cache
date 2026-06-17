@@ -1,0 +1,6 @@
+*~
+*.swp
+node_modules
+dist
+/test-results
+pages.gen.ts

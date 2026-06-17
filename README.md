@@ -1,2 +1,201 @@
 # waku-cache
-Cache for React Server Components in Waku
+
+A server cache for [Waku](https://waku.gg). Two primitives — **cache a function** and **cache an RSC subtree** — over a tiny, swappable storage interface.
+
+The cache is explicit: nothing is cached unless you wrap it, you choose each entry's key, and you invalidate through a method on your own cache instance. Keys are arrays, TanStack-Query style, and invalidation matches by prefix.
+
+## Install
+
+```bash
+npm install waku-cache
+```
+
+`react` and `waku` are peer dependencies; the library itself has no runtime dependencies. The unstorage store additionally needs `unstorage` (an optional peer dependency); the memory store needs nothing.
+
+## Quick start
+
+Create one cache instance for your app:
+
+```ts
+// src/lib/cache.ts
+import { createCache } from 'waku-cache';
+import { memoryStore } from 'waku-cache/stores/memory';
+
+export const cache = createCache({
+  store: memoryStore(),
+  defaults: { ttl: 60_000 }, // optional default TTL in ms
+});
+```
+
+Then reach for one of two primitives.
+
+## `cache.fn` — cache a function
+
+The common case. Wrap an async function; the call signature is unchanged, so it's a drop-in.
+
+```ts
+import { cache } from './lib/cache.js';
+
+const getProduct = cache.fn(
+  async (id: string) => db.products.findUnique({ where: { id } }),
+  {
+    key: (id) => ['product', id], // a function of the arguments
+    ttl: 5 * 60_000, // optional, overrides defaults.ttl
+  },
+);
+
+const product = await getProduct('abc'); // identical to the unwrapped call
+```
+
+- `key` is a **function of the arguments**, so it stays type-checked.
+- Concurrent misses for the same key are **single-flighted** within a process, so a burst of callers triggers one computation, not N.
+- Values are serialized with Waku's own `serializeRsc`, so `Date`, `Map`, `Set`, `BigInt`, `undefined` — anything React Flight handles — round-trip, with no extra dependency. (`null`/`undefined` results are cached too, so "not found" doesn't hit your database every time.)
+
+## `cache.rsc` — cache an RSC subtree
+
+Wrap a Server Component; its rendered subtree is serialized to RSC bytes once and replayed on later requests. A cached subtree is a single opaque blob to its parent, but the tree inside can still call other cached functions on a miss — composition works naturally.
+
+`cache.rsc` returns a `{ Component, getEtag }` pair:
+
+```tsx
+// src/pages/product.tsx
+import { cache } from '../lib/cache.js';
+
+const ProductCard = async ({ id }: { id: string }) => {
+  const product = await getProduct(id);
+  return <article>{product.name}</article>;
+};
+
+const { Component, getEtag } = cache.rsc(ProductCard, {
+  key: ({ id }) => ['ProductCard', id],
+  ttl: 60_000,
+});
+
+export default Component;
+```
+
+### The etag is opt-in
+
+The base capability above — serialize once, replay on hit — already saves the server from re-rendering. **`getEtag` is an optional optimization on top.** Wire it into `getConfig`'s `unstable_getEtag` and Waku will also skip re-sending the slot _on the wire_ during client navigation, for as long as the tag is unchanged:
+
+```tsx
+export const getConfig = () => {
+  return {
+    render: 'dynamic',
+    unstable_getEtag: getEtag, // delete this line and the render cache still works
+  } as const;
+};
+```
+
+The etag is a **content hash of the cached subtree** — just a label for what the client currently holds. On each request the server compares it with the client's and decides whether to re-send the element or let the client reuse its cache. So it changes exactly when the content changes — on invalidation _and_ on TTL expiry — and stays stable while the entry is fresh. On a miss it's computed by rendering once (the same render the request needed anyway), so the tag always matches the element being sent.
+
+## Keys and invalidation
+
+Keys are arrays of parts, like TanStack Query (a bare string is shorthand for a one-part key). Invalidation matches by **prefix**, so one call can drop a whole subtree of keys — this is how you express grouped/cross-cutting invalidation without a separate "tags" concept:
+
+```ts
+const getProduct = cache.fn(load, { key: (id) => ['product', id] });
+const ProductCard = cache.rsc(Card, {
+  key: ({ id }) => ['product', id, 'card'],
+});
+
+await cache.invalidate({ key: ['product', 'abc'] }); // this product + its card
+await cache.invalidate({ key: ['product'] }); // every product entry
+```
+
+Prefix matching is structural at part boundaries: `['product']` covers `['product', 'abc']` but never `['production']`.
+
+A common place to call `invalidate` is wherever you handle a mutation — for example, an API route (as the example app does):
+
+```ts
+// src/pages/_api/revalidate.ts
+import { cache } from '../../lib/cache.js';
+
+export async function POST(req: Request) {
+  const { id } = await req.json();
+  await cache.invalidate({ key: ['product', id] });
+  return new Response('ok');
+}
+```
+
+## Stores
+
+A store is the only thing you must choose. The contract is three methods (see [Bring your own](#bring-your-own-store)); two are built in.
+
+### `memoryStore()`
+
+```ts
+import { memoryStore } from 'waku-cache/stores/memory';
+
+createCache({ store: memoryStore() });
+```
+
+A `Map` with lazy TTL expiry on read, and in-memory partial-match invalidation. Zero dependencies. Perfect for dev, tests, and small single-node servers. State lives for the process lifetime.
+
+### `unstorageStore(storage)`
+
+```ts
+import { createStorage } from 'unstorage';
+import redisDriver from 'unstorage/drivers/redis';
+import { unstorageStore } from 'waku-cache/stores/unstorage';
+
+const storage = createStorage({
+  driver: redisDriver({ url: process.env.REDIS_URL }),
+});
+
+createCache({ store: unstorageStore(storage) });
+```
+
+Adapts any [unstorage](https://unstorage.unjs.io) `Storage` into a cache store, so a single adapter reaches **redis, Cloudflare KV/R2, Vercel KV, Upstash, filesystem, S3, MongoDB, PlanetScale**, and more — just swap the driver:
+
+```ts
+import cloudflareKVBinding from 'unstorage/drivers/cloudflare-kv-binding';
+import vercelKV from 'unstorage/drivers/vercel-kv';
+
+unstorageStore(
+  createStorage({ driver: cloudflareKVBinding({ binding: env.KV }) }),
+);
+unstorageStore(createStorage({ driver: vercelKV() }));
+```
+
+Notes:
+
+- RSC bytes are base64-encoded inside a JSON entry, so even string-only drivers work.
+- Native TTL is passed through to drivers that support it; expiry is _also_ enforced lazily on read for those that don't.
+- Invalidation maps the key to a `:`-separated unstorage key and uses the backend's native `getKeys(base)` (e.g. a Redis `SCAN MATCH`), so it lists only the matching subtree, not every key.
+
+### Bring your own store
+
+The interface is intentionally tiny. Keys arrive as arrays of already-encoded, separator-safe segments; the store joins/indexes them however it likes (`memoryStore` joins with `:` and partial-matches; `unstorageStore` maps them to `:`-separated unstorage keys):
+
+```ts
+interface CacheStore {
+  get(key: readonly string[]): Promise<CacheEntry | null>;
+  set(key: readonly string[], entry: CacheEntry): Promise<void>;
+  // remove the entry at `prefix` and every entry whose key has it as a leading
+  // sub-array (TanStack-style partial match)
+  delete(prefix: readonly string[]): Promise<void>;
+}
+
+interface CacheEntry {
+  value: Uint8Array; // serialized RSC bytes
+  createdAt: number;
+  expiresAt?: number; // absolute epoch ms; `get` must return null once past it
+}
+```
+
+## Examples
+
+- `examples/01_minimal` — a Waku app caching RSC pages with `cache.rsc`, wiring the opt-in `getEtag` into `getConfig`, and invalidating through an `/invalidate` API route. The e2e (`e2e/01_minimal.spec.ts`) asserts the server render cache (a fresh client is served the stored payload), the etag wire-skip on navigation, the re-send after invalidation, and a TTL page where the element is skipped while fresh and re-sent after expiry.
+
+Run it:
+
+```bash
+pnpm compile
+pnpm examples:01_minimal
+```
+
+## Limitations
+
+- **Single-flight is per process.** Concurrent misses collapse within one Node process; across processes you may compute the same value more than once.
+- **Invalidation uses prefix matching, not a prefix index** — the same model as TanStack Query (partial key matching). `memoryStore` does an in-memory partial-match over its `Map` (local, like TanStack). `unstorageStore` maps keys to `:`-separated unstorage keys and uses the backend's native `getKeys(base)` (e.g. a Redis `SCAN MATCH`), so it lists only the matching subtree rather than every key — though on a huge keyspace a server-side `SCAN` is still not O(matches); a dedicated secondary index would be.
